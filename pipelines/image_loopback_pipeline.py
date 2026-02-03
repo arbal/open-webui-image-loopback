@@ -13,9 +13,9 @@ from __future__ import annotations
 import os
 import base64
 import json
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, Optional, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class ExtractedImage:
     def __init__(self, mime_type: str, data: bytes, source: str) -> None:
@@ -54,8 +54,8 @@ def extract_tool_images(
     allow_url_fetch: bool,
     max_images: int,
     allowed_mime_types: Sequence[str],
-) -> List[ExtractedImage]:
-    images: List[ExtractedImage] = []
+) -> list[ExtractedImage]:
+    images: list[ExtractedImage] = []
     for obj in _iter_dicts(body):
         tool_name = obj.get("tool_name") or obj.get("tool") or obj.get("name")
         if tool_name not in allowed_tools:
@@ -95,7 +95,7 @@ def extract_tool_images(
 
 class Pipeline:
     class Valves(BaseModel):
-        pipelines: List[str] = []
+        pipelines: list[str] = Field(default_factory=list)
         priority: int = 0
         enable: bool = False
         allowed_tools: str = "generate_image"
