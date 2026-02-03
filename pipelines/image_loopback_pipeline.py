@@ -13,16 +13,15 @@ from __future__ import annotations
 import os
 import base64
 import json
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from pydantic import BaseModel
 
-@dataclass
 class ExtractedImage:
-    mime_type: str
-    data: bytes
-    source: str
+    def __init__(self, mime_type: str, data: bytes, source: str) -> None:
+        self.mime_type = mime_type
+        self.data = data
+        self.source = source
 
 
 def _safe_json_loads(value: str) -> Any:
