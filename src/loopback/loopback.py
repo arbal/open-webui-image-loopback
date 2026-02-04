@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Iterable, List, Mapping, Optional, Sequence
@@ -13,6 +14,21 @@ DEFAULT_FOLLOWUP_PROMPT = (
     "If it contains people, describe posture, expressions, and notable details. "
     "Then continue the task."
 )
+
+LOGGER_NAME = "loopback"
+_logger = logging.getLogger(LOGGER_NAME)
+_logger.addHandler(logging.NullHandler())
+
+
+def _configure_logging(log_level: str) -> None:
+    if not log_level:
+        return
+    normalized = log_level.strip().upper()
+    if normalized in {"OFF", "NONE", "DISABLED", "FALSE", "0"}:
+        _logger.disabled = True
+        return
+    _logger.disabled = False
+    _logger.setLevel(normalized)
 
 
 @dataclass(frozen=True)
@@ -28,6 +44,7 @@ class LoopbackConfig:
     max_images: int = 2
     auto_followup_prompt: str = DEFAULT_FOLLOWUP_PROMPT
     allow_url_fetch: bool = False
+    log_level: str = "WARNING"
 
     @staticmethod
     def from_env() -> "LoopbackConfig":
@@ -49,6 +66,7 @@ class LoopbackConfig:
         max_images = int(os.getenv("IMAGE_LOOPBACK_MAX_IMAGES", "2"))
         auto_prompt = os.getenv("IMAGE_LOOPBACK_AUTO_PROMPT", DEFAULT_FOLLOWUP_PROMPT)
         allow_url_fetch = os.getenv("IMAGE_LOOPBACK_ALLOW_URL_FETCH", "false").lower() == "true"
+        log_level = os.getenv("IMAGE_LOOPBACK_LOG_LEVEL", "WARNING")
         return LoopbackConfig(
             enabled=enabled,
             allowed_tools=allowed_tools,
@@ -57,6 +75,7 @@ class LoopbackConfig:
             max_images=max_images,
             auto_followup_prompt=auto_prompt,
             allow_url_fetch=allow_url_fetch,
+            log_level=log_level,
         )
 
 
@@ -99,33 +118,64 @@ def should_loopback(
     already_looped: bool,
     model_supports_vision: bool,
 ) -> LoopbackDecision:
+    _configure_logging(config.log_level)
+    _logger.debug(
+        "Evaluating loopback: enabled=%s already_looped=%s tool=%s model_supports_vision=%s images=%d",
+        config.enabled,
+        already_looped,
+        tool_result.tool_name,
+        model_supports_vision,
+        len(tool_result.images),
+    )
     if not config.enabled:
-        return LoopbackDecision(False, "loopback disabled")
+        reason = "loopback disabled"
+        _logger.info("Loopback skipped: %s", reason)
+        return LoopbackDecision(False, reason)
     if already_looped:
-        return LoopbackDecision(False, "loopback already performed")
+        reason = "loopback already performed"
+        _logger.info("Loopback skipped: %s", reason)
+        return LoopbackDecision(False, reason)
     if tool_result.tool_name not in config.allowed_tools:
-        return LoopbackDecision(False, "tool not allowlisted")
+        reason = "tool not allowlisted"
+        _logger.info("Loopback skipped: %s", reason)
+        return LoopbackDecision(False, reason)
     if not model_supports_vision:
-        return LoopbackDecision(False, "model lacks vision support")
+        reason = "model lacks vision support"
+        _logger.info("Loopback skipped: %s", reason)
+        return LoopbackDecision(False, reason)
     if not tool_result.images:
-        return LoopbackDecision(False, "no images in tool result")
+        reason = "no images in tool result"
+        _logger.info("Loopback skipped: %s", reason)
+        return LoopbackDecision(False, reason)
+    _logger.info("Loopback eligible for tool=%s with %d images", tool_result.tool_name, len(tool_result.images))
     return LoopbackDecision(True, "eligible", followup_prompt=config.auto_followup_prompt)
 
 
 def filter_images(config: LoopbackConfig, images: Iterable[ToolImage]) -> List[ToolImage]:
+    _configure_logging(config.log_level)
+    image_list = list(images)
     filtered: List[ToolImage] = []
-    for image in images:
+    for image in image_list:
         if image.mime_type not in config.allowed_mime_types:
+            _logger.debug("Skipping image due to mime type: %s", image.mime_type)
             continue
         if len(image.data) > config.max_bytes:
+            _logger.debug(
+                "Skipping image due to size: %d bytes (max %d)",
+                len(image.data),
+                config.max_bytes,
+            )
             continue
         filtered.append(image)
+        _logger.debug("Accepted image %d/%d", len(filtered), config.max_images)
         if len(filtered) >= config.max_images:
             break
+    _logger.info("Filtered %d images from %d candidates", len(filtered), len(image_list))
     return filtered
 
 
 def encode_base64_images(images: Sequence[ToolImage]) -> List[str]:
+    _logger.debug("Encoding %d images to base64", len(images))
     return [base64.b64encode(image.data).decode("utf-8") for image in images]
 
 
@@ -159,21 +209,32 @@ def apply_loopback(
     uploader: FileUploader,
     provider: VisionProvider,
 ) -> LoopbackDecision:
+    _configure_logging(config.log_level)
     decision = should_loopback(config, tool_result, already_looped, model_supports_vision)
     if not decision.should_loopback:
         return decision
 
     filtered = filter_images(config, tool_result.images)
     if not filtered:
-        return LoopbackDecision(False, "no images after filtering")
+        reason = "no images after filtering"
+        _logger.info("Loopback skipped: %s", reason)
+        return LoopbackDecision(False, reason)
 
     uploaded_files: List[UploadedFile] = []
     for image in filtered:
+        _logger.debug("Uploading image from source=%s mime_type=%s bytes=%d", image.source, image.mime_type, len(image.data))
         uploaded_files.append(uploader.upload(image))
 
     images_base64 = encode_base64_images(filtered)
-    provider.send_followup(decision.followup_prompt or config.auto_followup_prompt, uploaded_files, images_base64)
+    prompt = decision.followup_prompt or config.auto_followup_prompt
+    _logger.info(
+        "Sending followup prompt with %d files and %d base64 images",
+        len(uploaded_files),
+        len(images_base64),
+    )
+    provider.send_followup(prompt, uploaded_files, images_base64)
 
+    _logger.info("Loopback applied successfully with %d uploaded files", len(uploaded_files))
     return LoopbackDecision(
         True,
         "loopback applied",
