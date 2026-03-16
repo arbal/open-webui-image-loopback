@@ -5,7 +5,7 @@ date: 2026-02-03
 version: 0.2.0
 license: MIT
 description: Upload tool-generated images and trigger a follow-up vision turn automatically.
-requirements: pydantic, requests
+requirements: pydantic, aiohttp
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import base64
 import json
+import asyncio
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 from pydantic import BaseModel, Field
@@ -48,7 +49,7 @@ def _iter_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
             yield from _iter_dicts(item)
 
 
-def extract_tool_images(
+async def extract_tool_images(
     body: Dict[str, Any],
     allowed_tools: Sequence[str],
     allow_url_fetch: bool,
@@ -56,17 +57,39 @@ def extract_tool_images(
     allowed_mime_types: Sequence[str],
 ) -> list[ExtractedImage]:
     images: list[ExtractedImage] = []
+
+    # Pre-parse any stringified JSON tool calls if possible
+    # We will search the whole body but we also specifically look inside tool_calls
+
     for obj in _iter_dicts(body):
         tool_name = obj.get("tool_name") or obj.get("tool") or obj.get("name")
         if tool_name not in allowed_tools:
             continue
+
+        # Look in the arguments if it's a tool_call
+        arguments = obj.get("arguments")
+        if isinstance(arguments, str):
+            args_obj = _safe_json_loads(arguments) or {}
+            obj.update(args_obj)
+        elif isinstance(arguments, dict):
+            obj.update(arguments)
+
         raw_images = obj.get("images") or obj.get("image") or obj.get("output", {}).get("images")
+
+        # Sometime the result itself is a stringified JSON containing images
+        if not raw_images and "content" in obj and isinstance(obj["content"], str):
+            content_obj = _safe_json_loads(obj["content"])
+            if content_obj and isinstance(content_obj, dict):
+                 raw_images = content_obj.get("images") or content_obj.get("image")
+
         if not raw_images:
             continue
+
         if isinstance(raw_images, str):
             raw_images = _safe_json_loads(raw_images) or []
         if isinstance(raw_images, dict):
             raw_images = [raw_images]
+
         for image in raw_images:
             if not isinstance(image, dict):
                 continue
@@ -81,11 +104,16 @@ def extract_tool_images(
             elif "base64" in image:
                 data = _maybe_decode_base64(image["base64"])
             elif "url" in image and allow_url_fetch:
-                import requests
+                import aiohttp
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(image["url"], timeout=10) as response:
+                            response.raise_for_status()
+                            data = await response.read()
+                except Exception as e:
+                    print(f"Error fetching image from URL: {e}")
+                    continue
 
-                response = requests.get(image["url"], timeout=10)
-                response.raise_for_status()
-                data = response.content
             if data:
                 images.append(ExtractedImage(mime_type=mime_type, data=data, source=tool_name))
             if len(images) >= max_images:
@@ -135,13 +163,15 @@ class Pipeline:
         allowed_mime_types = [
             item.strip() for item in self.valves.allowed_mime_types.split(",") if item.strip()
         ]
-        images = extract_tool_images(
+
+        images = await extract_tool_images(
             body=body,
             allowed_tools=allowed_tools,
             allow_url_fetch=self.valves.allow_url_fetch,
             max_images=self.valves.max_images,
             allowed_mime_types=allowed_mime_types,
         )
+
         if not images:
             return body
 
@@ -154,48 +184,71 @@ class Pipeline:
             return body
 
         uploaded_file_ids = []
-        for image in filtered:
-            files = {"file": ("image", image.data, image.mime_type)}
-            import requests
 
-            response = requests.post(
-                f"{self.valves.openwebui_base_url}/api/v1/files/?process=false&process_in_background=false",
-                headers={"Authorization": f"Bearer {api_key}"},
-                files=files,
-                timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            file_id = payload.get("id") or payload.get("file_id")
-            if file_id:
-                uploaded_file_ids.append(file_id)
+        import aiohttp
 
-        if not uploaded_file_ids:
-            return body
+        async with aiohttp.ClientSession() as session:
+            for image in filtered:
+                form_data = aiohttp.FormData()
+                form_data.add_field(
+                    'file',
+                    image.data,
+                    filename='image.png',
+                    content_type=image.mime_type
+                )
 
-        chat_id = body.get("chat_id") or body.get("conversation_id")
-        messages = body.get("messages", [])
-        followup_message = {
-            "role": "user",
-            "content": self.valves.auto_prompt,
-            "metadata": {"loopback_done": True},
-        }
-        new_messages = [*messages, followup_message]
-        followup_payload = {
-            "model": body.get("model"),
-            "messages": new_messages,
-            "files": [{"id": file_id} for file_id in uploaded_file_ids],
-            "metadata": {"loopback_done": True},
-        }
-        if chat_id:
-            followup_payload["chat_id"] = chat_id
+                try:
+                    async with session.post(
+                        f"{self.valves.openwebui_base_url}/api/v1/files/?process=false&process_in_background=false",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        data=form_data,
+                        timeout=30,
+                    ) as response:
+                        response.raise_for_status()
+                        payload = await response.json()
+                        file_id = payload.get("id") or payload.get("file_id")
+                        if file_id:
+                            uploaded_file_ids.append(file_id)
+                except Exception as e:
+                    print(f"Error uploading image: {e}")
 
-        import requests
+            if not uploaded_file_ids:
+                return body
 
-        requests.post(
-            f"{self.valves.openwebui_base_url}/api/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=followup_payload,
-            timeout=60,
-        )
+            chat_id = body.get("chat_id") or body.get("conversation_id")
+            messages = body.get("messages", [])
+
+            # OpenWebUI and OpenAI expect files to be tied to the message content or as a direct property
+            # We add it as an array of files in the message, and set loopback_done to True
+            followup_message = {
+                "role": "user",
+                "content": self.valves.auto_prompt,
+                "metadata": {"loopback_done": True},
+                "files": [{"id": file_id} for file_id in uploaded_file_ids],
+            }
+            new_messages = [*messages, followup_message]
+
+            followup_payload = {
+                "model": body.get("model"),
+                "messages": new_messages,
+                "metadata": {"loopback_done": True},
+            }
+            if chat_id:
+                followup_payload["chat_id"] = chat_id
+
+            # Fire and forget the follow-up request so we don't block the current response stream
+            asyncio.create_task(self._send_followup(session, api_key, followup_payload))
+
         return body
+
+    async def _send_followup(self, session: Any, api_key: str, followup_payload: dict):
+        try:
+            async with session.post(
+                f"{self.valves.openwebui_base_url}/api/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=followup_payload,
+                timeout=60,
+            ) as response:
+                response.raise_for_status()
+        except Exception as e:
+            print(f"Error sending follow-up completion: {e}")
