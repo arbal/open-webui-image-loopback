@@ -237,18 +237,20 @@ class Pipeline:
                 followup_payload["chat_id"] = chat_id
 
             # Fire and forget the follow-up request so we don't block the current response stream
-            asyncio.create_task(self._send_followup(session, api_key, followup_payload))
+            asyncio.create_task(self._send_followup(api_key, followup_payload))
 
         return body
 
-    async def _send_followup(self, session: Any, api_key: str, followup_payload: dict):
+    async def _send_followup(self, api_key: str, followup_payload: dict):
+        import aiohttp
         try:
-            async with session.post(
-                f"{self.valves.openwebui_base_url}/api/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=followup_payload,
-                timeout=60,
-            ) as response:
-                response.raise_for_status()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.valves.openwebui_base_url}/api/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=followup_payload,
+                    timeout=60,
+                ) as response:
+                    response.raise_for_status()
         except Exception as e:
             print(f"Error sending follow-up completion: {e}")
